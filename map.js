@@ -1,14 +1,13 @@
 const vehicles = {};
 
-
 const routeColors = {
-    801: "#0072BC",
-    802: "#EB131B",
-    803: "#58A738",
-    804: "#FDB913",
-    805: "#A05DA5",
-    807: "#E56DB1",
-    unknown: "#888888"
+  801: "#0072BC",
+  802: "#EB131B",
+  803: "#58A738",
+  804: "#FDB913",
+  805: "#A05DA5",
+  807: "#E56DB1",
+  unknown: "#888888"
 };
 function initMap() {
   const map = new maplibregl.Map({
@@ -44,32 +43,33 @@ function addVehiclePopup(map) {
     closeButton: true,
     closeOnClick: true
   });
- 
+
   map.on("click", "trains-layer", (e) => {
     const feature = e.features[0];
     const coordinates = feature.geometry.coordinates.slice();
     const data = JSON.parse(feature.properties.data);
     const vehicle = data.vehicle || {};
- 
+
     const id = vehicle.vehicle?.id || data.id || "unknown";
     const route = data.route_code || "unknown";
     const lat = vehicle.position?.latitude?.toFixed(5);
     const lng = vehicle.position?.longitude?.toFixed(5);
- 
+
     const html = `
       <strong>Vehicle ${id}</strong><br/>
       Route: ${route}<br/>
       Lat: ${lat}<br/>
-      Lng: ${lng}
+      Lng: ${lng}<br/>
+      TripId:${vehicle.trip.tripId}
     `;
- 
+
     popup.setLngLat(coordinates).setHTML(html).addTo(map);
   });
- 
+
   map.on("mouseenter", "trains-layer", () => {
     map.getCanvas().style.cursor = "pointer";
   });
- 
+
   map.on("mouseleave", "trains-layer", () => {
     map.getCanvas().style.cursor = "";
   });
