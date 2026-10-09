@@ -23,7 +23,8 @@ const RECONNECT_MS = 5000;
 const PING_MS = 30000;
 
 const vehicles = {}; // vehicle id -> { marker, el, popup, routeCode, timestamp, lastSeen, data, anim }
-const tripUpdates = {}; // vehicle id -> { tripId, routeId, stops, lastSeen }
+const tripUpdates = {}; // vehicle id -> { tripId, routeId, directionId, startTime, relationship, stops, lastSeen }
+let selectedId = null;
 
 // =========================
 // MAP
@@ -38,7 +39,7 @@ function initMap() {
     minZoom: 8
   });
 
-  map.addControl(new maplibregl.NavigationControl(), "top-right");
+  map.addControl(new maplibregl.NavigationControl(), "bottom-right");
   map.on("zoom", resizeMarkers);
 
   return map;
@@ -133,6 +134,8 @@ function createVehicle(id, route, data, lngLat, ts) {
 
   const marker = new maplibregl.Marker({ element: el, anchor: "center" }).setLngLat(lngLat).setPopup(popup).addTo(map);
 
+  el.addEventListener("click", () => selectVehicle(id));
+
   vehicles[id] = {
     marker,
     el,
@@ -174,6 +177,7 @@ function removeVehicle(id) {
   if (v.anim) cancelAnimationFrame(v.anim);
   v.marker.remove();
   delete vehicles[id];
+  if (selectedId === id) closeTripPanel();
 }
 
 function prune() {
@@ -184,6 +188,8 @@ function prune() {
   for (const id in tripUpdates) {
     if (now - tripUpdates[id].lastSeen > REMOVE_AFTER_MS) delete tripUpdates[id];
   }
+  // keep "x min" countdowns fresh even if no new message arrived
+  if (selectedId) renderTripPanel();
 }
 
 // =========================
@@ -225,6 +231,7 @@ function handlePosition(data) {
     animateTo(existing, [lng, lat]);
   }
 
+  if (id === selectedId) renderTripPanel();
   setUpdateTime();
 }
 
@@ -242,21 +249,153 @@ function handleTripUpdate(data) {
   if (!ROUTES[routeId]) return;
 
   const stops = (tu.stopTimeUpdate || [])
-    .map((s) => ({
-      stopId: s.stopId,
-      stopSequence: s.stopSequence,
-      time: parseInt(s.arrival?.time || s.departure?.time, 10)
-    }))
+    .map((s) => {
+      const rawDelay = s.arrival?.delay ?? s.departure?.delay;
+      const delay = rawDelay != null ? parseInt(rawDelay, 10) : null;
+      return {
+        stopId: s.stopId,
+        stopSequence: s.stopSequence,
+        time: parseInt(s.arrival?.time || s.departure?.time, 10),
+        delay: Number.isFinite(delay) ? delay : null, // seconds, + late / - early
+        relationship: s.scheduleRelationship || "SCHEDULED"
+      };
+    })
     .filter((s) => Number.isFinite(s.time))
     .sort((a, b) => a.stopSequence - b.stopSequence);
 
   tripUpdates[vehicleId] = {
     tripId: tu.trip?.tripId,
     routeId,
+    directionId: tu.trip?.directionId,
+    startTime: tu.trip?.startTime,
+    relationship: tu.trip?.scheduleRelationship || "SCHEDULED",
     stops,
     lastSeen: Date.now()
   };
+
+  if (vehicleId === selectedId) renderTripPanel();
 }
+
+// =========================
+// TRIP PANEL
+// =========================
+
+function selectVehicle(id) {
+  if (selectedId && vehicles[selectedId]) vehicles[selectedId].el.classList.remove("is-selected");
+  selectedId = id;
+  vehicles[id]?.el.classList.add("is-selected");
+  renderTripPanel(true);
+}
+
+function closeTripPanel() {
+  if (selectedId && vehicles[selectedId]) vehicles[selectedId].el.classList.remove("is-selected");
+  selectedId = null;
+  const panel = document.getElementById("trippanel");
+  if (panel) {
+    panel.hidden = true;
+    panel.innerHTML = "";
+  }
+}
+
+// Overall delay = delay at the next upcoming stop that reports one.
+function delayStatus(trip, stops) {
+  if (trip?.relationship === "CANCELED") return { cls: "canceled", label: "Canceled", detail: "" };
+
+  const withDelay = stops.find((s) => s.delay != null);
+  if (!withDelay) {
+    return { cls: "unknown", label: "Delay unknown", detail: "Feed has predicted times only" };
+  }
+
+  const d = withDelay.delay;
+  const mins = Math.round(Math.abs(d) / 60);
+  if (Math.abs(d) < 60) return { cls: "on-time", label: "On time", detail: "" };
+  if (d > 0) return { cls: mins >= 5 ? "very-late" : "late", label: `${mins} min late`, detail: `at ${withDelay.stopId}` };
+  return { cls: "early", label: `${mins} min early`, detail: `at ${withDelay.stopId}` };
+}
+
+function renderTripPanel(resetScroll = false) {
+  const panel = document.getElementById("trippanel");
+  if (!panel) return;
+
+  const vehicle = vehicles[selectedId];
+  if (!vehicle) {
+    closeTripPanel();
+    return;
+  }
+
+  const r = ROUTES[vehicle.routeCode];
+  const v = vehicle.data.vehicle;
+  const tripId = v.trip?.tripId;
+  const tu = tripUpdates[selectedId];
+  const hasTrip = tu && (!tripId || tu.tripId === tripId);
+
+  const now = Date.now() / 1000;
+  const stops = hasTrip ? tu.stops.filter((s) => s.time >= now - 30) : [];
+  const status = delayStatus(hasTrip ? tu : null, stops);
+  const fmt = (t) => new Date(t * 1000).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  const speed = v.position?.speed != null ? `${Math.round(v.position.speed * 2.23694)} mph` : "—";
+
+  const list = stops.length
+    ? `<ol class="tp-stops">${stops
+        .map((s, i) => {
+          const mins = Math.max(0, Math.round((s.time - now) / 60));
+          const skipped = s.relationship === "SKIPPED";
+          let delay = "";
+          if (s.delay != null && Math.abs(s.delay) >= 60) {
+            const m = Math.round(Math.abs(s.delay) / 60);
+            delay = `<span class="tp-stop-delay ${s.delay > 0 ? "late" : "early"}">${s.delay > 0 ? "+" : "−"}${m} min</span>`;
+          }
+          return `
+            <li class="tp-stop${i === 0 ? " is-next" : ""}${skipped ? " is-skipped" : ""}">
+              <span class="tp-dot"></span>
+              <span class="tp-stop-id">${s.stopId}</span>
+              <span class="tp-stop-time">
+                <strong>${skipped ? "Skipped" : mins <= 0 ? "Now" : `${mins} min`}</strong>
+                <small>${fmt(s.time)}</small>
+                ${delay}
+              </span>
+            </li>`;
+        })
+        .join("")}</ol>`
+    : `<p class="tp-empty">${hasTrip ? "No upcoming stops reported." : "Waiting for trip updates…"}</p>`;
+
+  // keep the list's scroll position across live re-renders
+  const prevScroll = resetScroll ? 0 : panel.querySelector(".tp-stops")?.scrollTop || 0;
+
+  panel.style.setProperty("--route", r.color);
+  panel.innerHTML = `
+    <div class="tp-head">
+      <img class="tp-icon" src="${r.icon}" alt="">
+      <div>
+        <div class="tp-title">${r.name}</div>
+        <div class="tp-sub">Car ${selectedId}${tripId ? ` · Trip ${tripId}` : ""}</div>
+      </div>
+      <button class="tp-close" type="button" aria-label="Close trip panel">×</button>
+    </div>
+
+    <div class="tp-status ${status.cls}">
+      <span class="tp-status-label">${status.label}</span>
+      <span class="tp-status-detail">${status.detail}</span>
+    </div>
+
+    <dl class="tp-meta">
+      <div><dt>Speed</dt><dd>${speed}</dd></div>
+      <div><dt>Direction</dt><dd>${hasTrip && tu.directionId != null ? tu.directionId : "—"}</dd></div>
+      <div><dt>Started</dt><dd>${hasTrip && tu.startTime ? tu.startTime.slice(0, 5) : "—"}</dd></div>
+    </dl>
+
+    ${list}`;
+
+  panel.hidden = false;
+  panel.querySelector(".tp-close").addEventListener("click", closeTripPanel);
+
+  const listEl = panel.querySelector(".tp-stops");
+  if (listEl) listEl.scrollTop = prevScroll;
+}
+
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && selectedId) closeTripPanel();
+});
 
 function setUpdateTime() {
   const div = document.getElementById("update-time");
