@@ -1,128 +1,319 @@
-const vehicles = {};
+// =========================
+// CONFIG
+// =========================
 
-const routeColors = {
-  801: "#0072BC",
-  802: "#EB131B",
-  803: "#58A738",
-  804: "#FDB913",
-  805: "#A05DA5",
-  807: "#E56DB1",
-  unknown: "#888888"
+const ICON_BASE = "https://lacmta.github.io/metro-iconography/";
+
+// Only routes listed here are drawn — anything else (missing/unknown route_code) is skipped.
+const ROUTES = {
+  801: { name: "A Line", letter: "A", color: "#0072BC", icon: ICON_BASE + "Service_ALine.svg" },
+  802: { name: "B Line", letter: "B", color: "#EB131B", icon: ICON_BASE + "Service_BLine.svg" },
+  803: { name: "C Line", letter: "C", color: "#58A738", icon: ICON_BASE + "Service_CLine.svg" },
+  804: { name: "E Line", letter: "E", color: "#FDB913", icon: ICON_BASE + "Service_ELine2.svg" },
+  805: { name: "D Line", letter: "D", color: "#A05DA5", icon: ICON_BASE + "Service_DLine.svg" },
+  807: { name: "K Line", letter: "K", color: "#E56DB1", icon: ICON_BASE + "Service_KLine.svg" }
 };
+
+const POSITIONS_URL = "wss://api.metro.net/ws/LACMTA_Rail/vehicle_positions";
+const TRIP_UPDATES_URL = "wss://api.metro.net/ws/LACMTA_Rail/trip_updates";
+const STALE_SECONDS = 120; // ignore positions older than this
+const REMOVE_AFTER_MS = 3 * 60000; // drop trains / trip updates not heard from in this long
+const ANIMATION_MS = 1000; // marker glide duration
+const RECONNECT_MS = 5000;
+const PING_MS = 30000;
+
+const vehicles = {}; // vehicle id -> { marker, el, popup, routeCode, timestamp, lastSeen, data, anim }
+const tripUpdates = {}; // vehicle id -> { tripId, routeId, stops, lastSeen }
+
+// =========================
+// MAP
+// =========================
+
 function initMap() {
   const map = new maplibregl.Map({
     container: "map",
     style: "https://basemaps.cartocdn.com/gl/positron-gl-style/style.json",
     center: [-118.25, 34.05],
-    zoom: 10
+    zoom: 10,
+    minZoom: 8
   });
 
-  map.on("load", () => {
-    map.addSource("trains", {
-      type: "geojson",
-      data: { type: "FeatureCollection", features: [] }
-    });
-
-    map.addLayer({
-      id: "trains-layer",
-      type: "circle",
-      source: "trains",
-      paint: {
-        "circle-radius": 6,
-        "circle-color": ["get", "color"],
-        "circle-stroke-width": 1.5,
-        "circle-stroke-color": "#ffffff"
-      }
-    });
-  });
+  map.addControl(new maplibregl.NavigationControl(), "top-right");
+  map.on("zoom", resizeMarkers);
 
   return map;
 }
-function addVehiclePopup(map) {
-  const popup = new maplibregl.Popup({
-    closeButton: true,
-    closeOnClick: true
-  });
 
-  map.on("click", "trains-layer", (e) => {
-    const feature = e.features[0];
-    const coordinates = feature.geometry.coordinates.slice();
-    const data = JSON.parse(feature.properties.data);
-    const vehicle = data.vehicle || {};
-
-    const id = vehicle.vehicle?.id || data.id || "unknown";
-    const route = data.route_code || "unknown";
-    const lat = vehicle.position?.latitude?.toFixed(5);
-    const lng = vehicle.position?.longitude?.toFixed(5);
-
-    const html = `
-      <strong>Vehicle ${id}</strong><br/>
-      Route: ${route}<br/>
-      Lat: ${lat}<br/>
-      Lng: ${lng}<br/>
-      TripId:${vehicle.trip.tripId}
-    `;
-
-    popup.setLngLat(coordinates).setHTML(html).addTo(map);
-  });
-
-  map.on("mouseenter", "trains-layer", () => {
-    map.getCanvas().style.cursor = "pointer";
-  });
-
-  map.on("mouseleave", "trains-layer", () => {
-    map.getCanvas().style.cursor = "";
-  });
+function markerSize() {
+  return map.getZoom() >= 14 ? 28 : 18;
 }
 
-function connectVehicleFeed(map) {
-  const ws = new WebSocket("wss://api.metro.net/ws/LACMTA_Rail/vehicle_positions");
+function resizeMarkers() {
+  const size = markerSize();
+  for (const id in vehicles) {
+    vehicles[id].el.style.width = `${size}px`;
+    vehicles[id].el.style.height = `${size}px`;
+  }
+}
 
-  ws.onopen = () => console.log("WebSocket connected");
+// =========================
+// MARKERS
+// =========================
+
+function styleMarker(el, route) {
+  const size = markerSize();
+  el.style.width = `${size}px`;
+  el.style.height = `${size}px`;
+  el.style.borderRadius = "50%";
+  el.style.background = `#fff url(${route.icon}) no-repeat center/cover`;
+  el.style.boxShadow = `0 0 0 2px #fff, 0 1px 4px rgba(0,0,0,0.35)`;
+  el.style.cursor = "pointer";
+}
+
+function createVehicle(id, route, data, lngLat, ts) {
+  const el = document.createElement("div");
+  el.className = "marker";
+  el.dataset.vehicleId = id;
+  el.dataset.route = data.route_code;
+  styleMarker(el, route);
+
+  const popup = new maplibregl.Popup({ offset: 14, className: "vehicle-popup", maxWidth: "none" });
+
+  // Popup content is built when it opens, so it always shows the latest
+  // position + trip update data.
+  popup.on("open", () => {
+    const vehicle = vehicles[id];
+    if (!vehicle) return;
+
+    const r = ROUTES[vehicle.routeCode];
+    const v = vehicle.data.vehicle;
+    const speed = v.position?.speed != null ? `${Math.round(v.position.speed * 2.23694)} mph` : "—";
+    const time = v.timestamp ? new Date(parseInt(v.timestamp, 10) * 1000).toLocaleTimeString() : "—";
+
+    // Next stop from the trip update: first stop whose arrival hasn't passed yet.
+    let nextStop = "—";
+    let eta = "";
+    let arrives = "—";
+    const tu = tripUpdates[id];
+    if (tu && (!v.trip?.tripId || tu.tripId === v.trip.tripId)) {
+      const now = Date.now() / 1000;
+      const next = tu.stops.find((s) => s.time >= now - 30);
+      if (next) {
+        const mins = Math.max(0, Math.round((next.time - now) / 60));
+        nextStop = next.stopId;
+        eta = mins <= 0 ? "Now" : `${mins} min`;
+        arrives = new Date(next.time * 1000).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+      }
+    }
+
+    popup.setHTML(`
+      <div class="vp" style="--route:${r.color}">
+        <div class="vp-head">
+          <img class="vp-icon" src="${r.icon}" alt="">
+          <div>
+            <div class="vp-title">${r.name}</div>
+            <div class="vp-sub">Car ${id}</div>
+          </div>
+        </div>
+        <div class="vp-next">
+          <div>
+            <span class="vp-next-label">Next stop</span>
+            <span class="vp-next-stop">${nextStop}</span>
+          </div>
+          <span class="vp-eta">${eta}</span>
+        </div>
+        <dl class="vp-grid">
+          <div><dt>Arrives</dt><dd>${arrives}</dd></div>
+          <div><dt>Speed</dt><dd>${speed}</dd></div>
+          <div><dt>Trip</dt><dd>${v.trip?.tripId ?? "—"}</dd></div>
+          <div><dt>Updated</dt><dd>${time}</dd></div>
+        </dl>
+      </div>`);
+  });
+
+  const marker = new maplibregl.Marker({ element: el, anchor: "center" }).setLngLat(lngLat).setPopup(popup).addTo(map);
+
+  vehicles[id] = {
+    marker,
+    el,
+    popup,
+    routeCode: String(data.route_code),
+    timestamp: ts,
+    lastSeen: Date.now(),
+    data,
+    anim: null
+  };
+}
+
+function animateTo(vehicle, target) {
+  if (vehicle.anim) cancelAnimationFrame(vehicle.anim);
+
+  // No point animating in a background tab — just jump.
+  if (document.hidden) {
+    vehicle.marker.setLngLat(target);
+    return;
+  }
+
+  const start = vehicle.marker.getLngLat();
+  const dLng = target[0] - start.lng;
+  const dLat = target[1] - start.lat;
+  const t0 = performance.now();
+
+  const step = (now) => {
+    const p = Math.min((now - t0) / ANIMATION_MS, 1);
+    const eased = p < 0.5 ? 4 * p * p * p : 1 - Math.pow(-2 * p + 2, 3) / 2;
+    vehicle.marker.setLngLat([start.lng + dLng * eased, start.lat + dLat * eased]);
+    vehicle.anim = p < 1 ? requestAnimationFrame(step) : null;
+  };
+  vehicle.anim = requestAnimationFrame(step);
+}
+
+function removeVehicle(id) {
+  const v = vehicles[id];
+  if (!v) return;
+  if (v.anim) cancelAnimationFrame(v.anim);
+  v.marker.remove();
+  delete vehicles[id];
+}
+
+function prune() {
+  const now = Date.now();
+  for (const id in vehicles) {
+    if (now - vehicles[id].lastSeen > REMOVE_AFTER_MS) removeVehicle(id);
+  }
+  for (const id in tripUpdates) {
+    if (now - tripUpdates[id].lastSeen > REMOVE_AFTER_MS) delete tripUpdates[id];
+  }
+}
+
+// =========================
+// DATA — VEHICLE POSITIONS
+// =========================
+
+function handlePosition(data) {
+  const v = data?.vehicle;
+  if (!v || !v.position || !v.trip) return;
+
+  const route = ROUTES[data.route_code];
+  if (!route) return; // skip unknown routes — no grey dots
+
+  const id = v.vehicle?.id || data.id;
+  const lat = Number(v.position.latitude);
+  const lng = Number(v.position.longitude);
+  if (!id || !Number.isFinite(lat) || !Number.isFinite(lng)) return;
+
+  const ts = parseInt(v.timestamp, 10) || 0;
+  if (ts && Date.now() / 1000 - ts > STALE_SECONDS) return;
+
+  const existing = vehicles[id];
+
+  if (!existing) {
+    createVehicle(id, route, data, [lng, lat], ts);
+  } else {
+    if (ts && existing.timestamp && ts <= existing.timestamp) return; // out-of-order/duplicate
+
+    existing.timestamp = ts;
+    existing.lastSeen = Date.now();
+    existing.data = data;
+
+    if (existing.routeCode !== String(data.route_code)) {
+      existing.routeCode = String(data.route_code);
+      existing.el.dataset.route = data.route_code;
+      styleMarker(existing.el, route);
+    }
+
+    animateTo(existing, [lng, lat]);
+  }
+
+  setUpdateTime();
+}
+
+// =========================
+// DATA — TRIP UPDATES
+// =========================
+
+function handleTripUpdate(data) {
+  const tu = data?.tripUpdate;
+  const vehicleId = tu?.vehicle?.id;
+  if (!tu || !vehicleId) return;
+
+  // route_code comes through empty on this feed — use trip.routeId instead.
+  const routeId = tu.trip?.routeId || data.route_code;
+  if (!ROUTES[routeId]) return;
+
+  const stops = (tu.stopTimeUpdate || [])
+    .map((s) => ({
+      stopId: s.stopId,
+      stopSequence: s.stopSequence,
+      time: parseInt(s.arrival?.time || s.departure?.time, 10)
+    }))
+    .filter((s) => Number.isFinite(s.time))
+    .sort((a, b) => a.stopSequence - b.stopSequence);
+
+  tripUpdates[vehicleId] = {
+    tripId: tu.trip?.tripId,
+    routeId,
+    stops,
+    lastSeen: Date.now()
+  };
+}
+
+function setUpdateTime() {
+  const div = document.getElementById("update-time");
+  if (div) div.textContent = `Live · ${new Date().toLocaleTimeString()}`;
+
+  const count = document.getElementById("vehicle-count");
+  if (count) count.textContent = Object.keys(vehicles).length;
+}
+
+// =========================
+// WEBSOCKET
+// =========================
+
+function connectFeed(url, onData) {
+  const ws = new WebSocket(url);
+  let pingTimer = null;
+
+  ws.onopen = () => {
+    console.log(`WebSocket connected: ${url}`);
+    pingTimer = setInterval(() => {
+      if (ws.readyState === WebSocket.OPEN) ws.send("ping");
+    }, PING_MS);
+  };
 
   ws.onmessage = (event) => {
+    let data;
     try {
-      const data = JSON.parse(event.data);
-      const vehicle = data.vehicle;
-      if (!vehicle || !vehicle.position) return;
-
-      const id = vehicle.vehicle?.id || data.id;
-      const lat = vehicle.position.latitude;
-      const lng = vehicle.position.longitude;
-      const route = data.route_code || "unknown";
-
-      vehicles[id] = {
-        coordinates: [lng, lat],
-        color: routeColors[route] || routeColors.unknown,
-        data: JSON.stringify(data)
-      };
-
-      const features = Object.values(vehicles).map((v) => ({
-        type: "Feature",
-        geometry: { type: "Point", coordinates: v.coordinates },
-        properties: { color: v.color, data: v.data }
-      }));
-
-      const source = map.getSource("trains");
-      if (source) {
-        source.setData({
-          type: "FeatureCollection",
-          features
-        });
-      }
+      data = JSON.parse(event.data);
+    } catch {
+      return; // non-JSON frames (e.g. pong)
+    }
+    try {
+      onData(data);
     } catch (err) {
-      console.error("WebSocket error:", err);
+      console.error(`Error handling message from ${url}:`, err);
     }
   };
 
-  ws.onclose = () => console.log("WebSocket closed");
-  ws.onerror = (err) => console.error("WebSocket error event:", err);
+  ws.onerror = (err) => console.error(`WebSocket error: ${url}`, err);
+
+  ws.onclose = () => {
+    console.log(`WebSocket closed — reconnecting: ${url}`);
+    clearInterval(pingTimer);
+    setTimeout(() => connectFeed(url, onData), RECONNECT_MS);
+  };
 
   return ws;
 }
 
+// =========================
+// START
+// =========================
+
 const map = initMap();
+
 map.on("load", () => {
-  connectVehicleFeed(map);
-  addVehiclePopup(map);
+  connectFeed(POSITIONS_URL, handlePosition);
+  connectFeed(TRIP_UPDATES_URL, handleTripUpdate);
+  setInterval(prune, 15000);
 });

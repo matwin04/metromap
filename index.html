@@ -1,15 +1,56 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <title>Map</title>
-  <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
-  <link href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" rel="stylesheet" />
-  <link rel="stylesheet" href="https://lacmta.github.io/design-system/dist/css/styles.css" type="text/css">
-  <link href="main.css" rel="stylesheet"/>
-</head>
-<body>
-  <div id="map"></div>
-  <script src="map.js"></script>
-</body>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Metro Rail Live</title>
+
+    <link rel="stylesheet" href="https://lacmta.github.io/design-system/dist/css/styles.css" />
+    <link rel="stylesheet" href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      rel="stylesheet"
+      href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@500&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" />
+    <link rel="stylesheet" href="main.css" />
+
+    <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+  </head>
+
+  <body>
+    <main id="app">
+      <section id="map" aria-label="Map of live Metro Rail trains"></section>
+
+      <header class="panel" id="header">
+        <div class="header-top">
+          <div class="brand">
+            <span class="brand-mark" aria-hidden="true">M</span>
+            <div>
+              <h1 class="brand-title">Metro Rail Live</h1>
+              <p class="brand-status">
+                <span class="status-dot" aria-hidden="true"></span>
+                <span id="update-time">Connecting…</span>
+              </p>
+            </div>
+          </div>
+
+          <div class="stat" title="Trains currently on the map">
+            <span class="stat-value" id="vehicle-count">0</span>
+            <span class="stat-label">trains</span>
+          </div>
+        </div>
+
+        <ul class="legend" aria-label="Lines">
+          <li><img src="https://lacmta.github.io/metro-iconography/Service_ALine.svg" alt="" />A Line</li>
+          <li><img src="https://lacmta.github.io/metro-iconography/Service_BLine.svg" alt="" />B Line</li>
+          <li><img src="https://lacmta.github.io/metro-iconography/Service_CLine.svg" alt="" />C Line</li>
+          <li><img src="https://lacmta.github.io/metro-iconography/Service_DLine.svg" alt="" />D Line</li>
+          <li><img src="https://lacmta.github.io/metro-iconography/Service_ELine2.svg" alt="" />E Line</li>
+          <li><img src="https://lacmta.github.io/metro-iconography/Service_KLine.svg" alt="" />K Line</li>
+        </ul>
+      </header>
+    </main>
+
+    <script src="map.js"></script>
+  </body>
 </html>
